@@ -1,0 +1,17 @@
+[{
+	"hostname": "default",
+	"username": "scoky",
+	"ssh_options": "-i /home/scoky/.ssh/id_rsa"
+},
+{
+	"hostname": "localhost",
+	"wd": "~/github/concurrent/work1"
+},
+{
+	"hostname": "localhost",
+	"wd": "~/github/concurrent/work2"
+},
+{
+	"hostname": "localhost",
+	"wd": "~/github/concurrent/work3"
+}]

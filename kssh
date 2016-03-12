@@ -1,0 +1,473 @@
+#!/usr/bin/python
+
+import os
+import sys
+import json
+import uuid
+import glob
+import time
+import shlex
+import shutil
+import pipes
+import random
+import argparse
+import subprocess
+from collections import deque
+
+# Parameters for updating recheck period
+MIN_INT = 1
+MAX_INT = 300
+ALPHA = 0.75
+def compute_interval(sample, previous):
+    return min(MAX_INT, max(MIN_INT, int(ALPHA * sample / 3 + (1-ALPHA) * previous)))
+# Unique key for this run
+KEY = uuid.uuid4()
+# Parameters: ssh options, username, hostname
+CONNECT = "ssh {0} {1}@{2}"
+# Parameters: working directory, pid file, input file, task, output file, error file
+# Clean up remote filesystem and kill process if still running
+CLEANUP = """#!/bin/bash
+    cd {0}; 
+    pids=`cat {1}`; 
+    if [ -z \"$pids\" ]; then 
+        kill $pids; 
+    fi; 
+    rm {1} {2} {4} {5}; 
+    echo Done;"""
+# Check the remote status for liveness and completion
+CHECK = """#!/bin/bash
+    cd {0}; 
+    echo `cat {1}`,`stat -c '%Y' {1}`;"""
+# Fetch the completed output file
+FETCH = """#!/bin/bash
+    cd {0}; 
+    cat {4};
+    cat {5} >&2;"""
+# For testing
+TEST = """#!/bin/bash
+    echo testing;"""
+# Run a remote command
+START = """#!/bin/bash
+    mkdir -p {0};
+    cd {0};
+    touch {1}; 
+    cat >{2}; 
+    monitor() {{ 
+        user_command() {{
+            {3}
+        }}
+        user_command &
+        while true; do 
+            pids=`jobs -rp`; 
+            if [ -z \"$pids\" ]; then 
+                break; 
+            fi; 
+            echo $pids >{1}; 
+            sleep 1; 
+        done; 
+        echo 'Done' >{1}; 
+    }}; 
+    monitor </dev/null >/dev/null 2>/dev/null & 
+    echo `stat -c '%Y' {1}`;"""
+# The actual task will look like this:
+# <{0} COMMAND >{1} 2>{2} where parameters are input, output, and error files
+def subformat(command, machine, task):
+    # Build the command
+    pidfile, infile, outfile, errfile = ['kssh_{0}_pid'.format(KEY), 'kssh_{0}_in'.format(KEY), 'kssh_{0}_out'.format(KEY), 'kssh_{0}_err'.format(KEY)]
+    connect = CONNECT.format(machine.ssh_options, machine.username, machine.hostname)
+    task = task.format(infile, outfile, errfile)
+    command = command.format(machine.wd, pidfile, infile, task, outfile, errfile)
+    return '{0} {1}'.format(connect, pipes.quote(command))
+    
+def execute(command):
+    #log(LOCALHOST, 'executing shell script')
+    return subprocess.check_output(command, shell=True)
+
+LOCALHOST='localhost'
+def log(host, msg):
+    print >>sys.stderr, '[{0}][{1}] {2}'.format(time.ctime(), host, msg)
+
+class Machine(object):
+    def __init__(self, hostname, username, wd = '.', ssh_options = '', polling_interval = 10):
+        self.hostname = hostname
+        self.username = username
+        self.wd = wd
+        self.ssh_options = ssh_options
+        self.recheck = polling_interval
+        self.start = None
+        self.block = None
+        self.polled = None
+        self.heartbeat = ''
+        self._errors = 0
+        self._exclude = False
+        log(self.hostname, 'initializing machine << username = {0}, wd = {1}, polling_interval = {2}, ssh_options = {3} >>'.format(username, wd, polling_interval, ssh_options))
+
+    def exclude(self):
+        return self._exclude
+        
+    def error(self):
+        self._errors += 1
+        if self._errors > 5:
+            log(self.hostname, 'excluding for too many errors')
+            self._exclude = True
+        return self.exclude()
+
+class Output(object):
+    def __init__(self, output, temp_directory, single_file = False):
+        if not os.path.isdir(temp_directory):
+            os.makedirs(temp_directory)
+        if single_file and type(output) is str and os.path.isdir(output):
+            raise Exception('Output must be a file!')
+        elif single_file and os.path.isfile(output):
+            os.remove(output)
+        elif not single_file and type(output) is not str:
+            raise Exception('Cannot write to stdout')
+        elif not single_file and not os.path.isdir(output):
+            os.makedirs(output)
+        self.temp_directory = temp_directory
+        self.single_file = single_file
+        self.output = output
+        self.temp_files = set()
+
+    def createTempFile(self):
+        filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(uuid.uuid4()))
+        while filename in self.temp_files:
+            filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(uuid.uuid4()))
+        log(LOCALHOST, 'created temporary file "{0}"'.format(filename))
+        self.temp_files.add(filename)
+        return filename
+        
+    def writeOutput(self, block, infile):
+        if self.single_file:
+            with open(infile, 'r') as temp_file:
+                with open(self.output, 'a') as out_file:
+                    out_file.writelines(temp_file.readlines())
+            self.removeTempFile(infile)
+        else:
+            filename = os.path.join(self.output, os.path.basename(block.stream())+'.out')
+            i = 0
+            while os.path.isfile(filename):
+                i += 1
+                filename = os.path.join(self.output, os.path.basename(block.stream())+'.out'+str(i))
+            shutil.move(infile, filename)
+            self.temp_files.remove(infile)
+
+    def removeTempFile(self, filename):
+        if filename in self.temp_files:
+            log(LOCALHOST, 'removing temporary file "{0}"'.format(filename))
+            self.temp_files.remove(filename)
+            try:
+                os.remove(filename)
+            except OSError as e:
+                log(LOCALHOST, 'error removing "{0}": {1}'.format(filename, e))
+        else:
+            log(LOCALHOST, 'missing temporary file "{0}"'.format(filename))
+
+    def close(self):
+        # Remove all temporary files
+        for filename in self.temp_files.copy():
+            self.removeTempFile(filename)
+
+class Producer(object):
+    def __init__(self, data, blocksize):
+        self.data = data
+        self.blocksize = blocksize
+        self.retries = deque()
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        if len(self.retries) > 0:
+            return self.retries.popleft()
+        return self._next()
+
+    def _next(self):
+        raise Exception('Not Implemented!')
+
+    def retry(self, product):
+        self.retries.append(product)
+
+    def more(self):
+        return len(self.retries) > 0 or self._more()
+
+    def _more(self):
+        raise Exception('Not Implemented!')
+
+    def close(self):
+        pass
+
+class Product(object):
+    def __init__(self, data, key):
+        self.data = data
+        self.key = key
+
+    def stream(self):
+        return self.data
+
+    def name(self):
+        return self.key
+
+class FileProducer(Producer):
+    def __init__(self, data):
+        super(self.__class__, self).__init__(data, 1)
+        self.i = 0
+
+    def _next(self):
+        if self.i < len(self.data):
+            key = self.data[self.i]
+            self.i += 1
+            return Product(key, 'file {0}'.format(key))
+        raise StopIteration()
+
+    def _more(self):
+        return self.i < len(self.data)
+
+class LineProducer(Producer):
+    def __init__(self, data, blocksize = 1, output = None):
+        super(self.__class__, self).__init__(data, blocksize)
+        self.output = output
+        self.EOF = False
+        self.i = 0
+
+    def _next(self):
+        lines = []
+        x = 0
+        while x < self.blocksize:
+            try:
+                line = self.data.next()
+                lines.append(line)
+                x += 1
+            except StopIteration:
+                self.EOF = True
+                if len(lines) == 0:
+                    raise StopIteration()
+                else:
+                    break
+        filename = self.output.createTempFile()
+        with open(filename, 'w') as temp_file:
+            temp_file.writelines(lines)
+        start_index = self.i
+        self.i += x
+        return Product(filename, 'lines [{0},{1}]'.format(start_index+1, self.i))
+            
+    def _more(self):
+        return not self.EOF
+
+    def close(self):
+        self.data.close()
+
+class Distributor(object):
+    def __init__(self, source, machines, output, task):
+        self.source = source
+        self.machines = machines
+        self.output = output
+        self.task = task
+
+    def run(self):
+        # While there is more data to crunch
+        # or some machines are currently processing
+        processing = True
+        while processing:
+            min_recheck = time.time() + 120
+            log(LOCALHOST, 'scanning')
+
+            processing = False
+            for machine in self.machines:
+                # Machine currently crunching on a block
+                if machine.block:
+                    processing = True
+                    if machine.polled + machine.recheck < time.time():
+                        # Time to check the machine again
+                        self.check(machine)
+                elif not machine.exclude() and self.source.more():
+                    try:
+                        self.dispatch(machine, self.source.next())
+                        processing = True
+                    except StopIteration:
+                        # Out of source to process
+                        pass
+                if not machine.exclude():
+                    min_recheck = min(machine.polled + machine.recheck, min_recheck)
+
+            min_recheck = max(1, int(min_recheck - time.time()))
+            log(LOCALHOST, 'sleeping {0} seconds'.format(min_recheck))
+            time.sleep(min_recheck)
+        for machine in self.machines:
+            self.cleanup(machine)
+
+    def dispatch(self, machine, block):
+        log(machine.hostname, 'assigning task "{0}"'.format(block.name()))
+        try:
+            machine.start = int(execute('<{0} '.format(block.stream()) + subformat(START, machine, self.task)))
+        except subprocess.CalledProcessError as e:
+            log(machine.hostname, 'error dispatching task << {0} >>'.format(e))
+            self.source.retry(block)
+            machine.error()
+        else:
+            machine.block = block
+            machine.polled = time.time()
+            
+    def check(self, machine):
+        log(machine.hostname, 'polling')
+        machine.polled = time.time()
+        heartbeat = None
+        pid = None
+        try:
+            check = execute(subformat(CHECK, machine, self.task)).strip().split(',')
+            if len(check) >= 2:
+                heartbeat = int(check[1])
+            if len(check) >= 1:
+                pid = check[0]
+            log(machine.hostname, 'heartbeat = {0}, status = {1}'.format(heartbeat, pid))
+        except subprocess.CalledProcessError as e:
+            log(machine.hostname, 'error polling << {0} >>'.format(e))
+            if machine.error():
+                self.source.retry(machine.block)
+                machine.block = None
+        else:
+            if pid == 'Done':
+                # Task finished                
+                log(machine.hostname, 'task complete')
+                # WMA for recheck period updated to half of the time to task completion
+                machine.recheck = compute_interval(heartbeat - machine.start, machine.recheck)
+                log(machine.hostname, 'polling_interval = {0} seconds'.format(machine.recheck))
+                self.fetch(machine)
+            elif heartbeat == None or heartbeat == machine.heartbeat:
+                # Heartbeat hasn't updated, process may not be running any longer
+                log(machine.hostname, 'heartbeat failure')
+                if machine.error():
+                    self.source.retry(machine.block)
+                    machine.block = None
+            machine.heartbeat = heartbeat
+
+    def fetch(self, machine):
+        try:
+            filename_out = self.output.createTempFile()
+            filename_err = self.output.createTempFile()
+            log(machine.hostname, 'writing stdout to "{0}"'.format(filename_out))
+            log(machine.hostname, 'writing stderr to "{0}"'.format(filename_err))
+            execute(subformat(FETCH, machine, self.task) + ' >{0}'.format(filename_out) + ' 2>{0}'.format(filename_err))
+        except subprocess.CalledProcessError as e:
+            log(machine.hostname, 'error fetching << {1} >>'.format(e))
+            machine.error()
+        else:
+            log(machine.hostname, 'fetch complete for task "{0}"'.format(machine.block.name()))
+            self.output.writeOutput(machine.block, filename_out)
+            with open(filename_err, 'r') as file_err:
+                content = file_err.read()
+                if content != '':
+                    log(machine.hostname, 'remote error << {0} >>'.format(content))
+            self.output.removeTempFile(filename_err)
+            machine.block = None
+
+    def cleanup(self, machine):
+        log(machine.hostname, 'clean up')
+        try:
+            execute(subformat(CLEANUP, machine, self.task))
+        except subprocess.CalledProcessError as e:
+            log(machine.hostname, 'error cleaning up << {0} >>'.format(e))
+
+def load_machines_config(filename):
+    """ Load machines configuration data from a JSON configuration file. """
+    json_data = None
+    with open(filename, 'r') as machines:
+        json_data = json.load(machines)
+
+    # Find default
+    default = None
+    for data in json_data:
+        # Machine missing hostname, fatal
+        if 'hostname' not in data:
+            raise Exception('machine missing required property "hostname"')
+        if data['hostname'].lower() == 'default':
+            # Set defaults
+            default = data
+            break
+
+    # Convert to class
+    machines = []
+    for data in json_data:
+        # Set defaults
+        if default:
+            for value in default:
+                if value not in data:
+                    data[value] = default[value]
+        if data['hostname'] != 'default':
+            machines.append(Machine(**data))
+    return machines
+
+if __name__ == "__main__":
+    # set up command line args
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,\
+                                     description='Split a task across machines')
+    parser.add_argument('-o', '--output', default=sys.stdout, help='file or directory to write output')
+    parser.add_argument('-i', '--input', nargs='+', default=[sys.stdin], help='data to be distributed')
+    parser.add_argument('-b', '--blocksize', type=int, default=1, help='number of lines to assign per block (only works if input is a single file)')
+    parser.add_argument('-s', '--shuffle', action='store_true', default=False, help='shuffle the input before distribution')
+    parser.add_argument('-m', '--machines', default='.machines', help='json file listing the machines to be used')
+    parser.add_argument('-t', '--task', default='sleep 3 && <{0} cat >{1} 2>{2}', help='bash commands to execute on remote machines. Use {0} for input, {1} for output, and {2} for error')
+    parser.add_argument('-e', '--temp_directory', default='.', help='directory for writing temporary files')
+    args = parser.parse_args()
+
+    log(LOCALHOST, "experiment key = {0}".format(KEY))
+
+    machines = load_machines_config(args.machines)
+    
+    task = None
+    # User can specify a file containing the task
+    if os.path.isfile(args.task):
+        with open(args.task, 'r') as task_file:
+            task = task_file.read()
+    # Or a command at the command line
+    else:
+        task = args.task
+
+    # Collect sources
+    sources = []
+    for source in args.input:
+        # If source is a string, add the glob of files
+        if type(source) is str:
+            sources.extend(glob.glob(source))
+        # Else there is only one source and it is stdin
+        else:
+            sources.append(source)
+    # Shuffle order of sources
+    if args.shuffle:
+            random.shuffle(sources)
+            
+    # Create the output object
+    output = Output(args.output, args.temp_directory, single_file = len(sources) == 1)
+
+    # Shuffling input lines
+    if len(sources) == 1 and args.shuffle:
+        log(LOCALHOST, "warning: shuffling input lines requires reading all input into memory")
+        if type(sources[0]) is str:
+            sources[0] = open(sources[0], 'r')
+        data = sources[0].readlines()
+        sources[0].close()
+        # Shuffle
+        random.shuffle(data)
+        # Write to temporary file
+        filename = output.createTempFile()
+        with open(filename, 'w') as data_file:
+            data_file.writelines(data)
+        data = None
+        sources[0] = filename
+
+    source = None
+    # Data is a single source to be split by lines
+    if len(sources) == 1:
+        if type(sources[0]) is str:
+            sources[0] = open(sources[0], 'r')
+        source = LineProducer(sources[0], args.blocksize, output)
+    # Source is a set of files
+    else:
+        # Blocksize meaningless when distributing files
+        if args.blocksize != 1:
+            log(LOCALHOST, "warning: block size must be 1 when input is multiple files")
+        source = FileProducer(sources)
+
+    Distributor(source, machines, output, task).run()
+    source.close()
+    output.close()
