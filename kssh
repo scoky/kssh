@@ -23,8 +23,10 @@ def createUUID():
     return str(uuid.uuid4())[:8]
 KEY = createUUID()
 LOCALHOST='localhost'
+mutex = threading.Lock()
 def log(host, msg):
-    print >>sys.stderr, '[{0}] [{1}] {2}'.format(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), host, msg)
+    with mutex:
+        print >>sys.stderr, '[{0}] [{1}] {2}'.format(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), host, msg)
 
 class input_mode(object):
     ''' Method of dividing data among nodes. '''
@@ -210,7 +212,7 @@ class Machine(object):
     def error(self):
         self._errors += 1
         if self._errors > 5:
-            log(self.hostname, 'excluding for too many errors')
+            log(self.hostname, 'EXCLUDING')
             self._exclude = True
         return self.exclude()
 
