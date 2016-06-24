@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+while read x; do
+  echo $x;
+  sleep $(( $RANDOM % 10 ))
+done
+echo 'testing stderr' >&2
+exit $(( $RANDOM % 2 ))

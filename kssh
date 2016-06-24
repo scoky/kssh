@@ -6,105 +6,207 @@ import json
 import uuid
 import glob
 import time
-import shlex
-import shutil
+import math
 import pipes
+import shlex
+import signal
+import shutil
 import random
 import argparse
+import threading
 import subprocess
 from collections import deque
+from datetime import datetime
 
-# Parameters for updating recheck period
-MIN_INT = 1
-MAX_INT = 300
-ALPHA = 0.75
-def compute_interval(sample, previous):
-    return min(MAX_INT, max(MIN_INT, int(ALPHA * sample / 3 + (1-ALPHA) * previous)))
 # Unique key for this run
-KEY = uuid.uuid4()
-# Parameters: ssh options, username, hostname
-CONNECT = "ssh {0} {1}@{2}"
-# Parameters: working directory, pid file, input file, task, output file, error file
-# Clean up remote filesystem and kill process if still running
-CLEANUP = """#!/bin/bash
-    cd {0}; 
-    pids=`cat {1}`; 
-    if [ -z \"$pids\" ]; then 
-        kill $pids; 
-    fi; 
-    rm {1} {2} {4} {5}; 
-    echo Done;"""
-# Check the remote status for liveness and completion
-CHECK = """#!/bin/bash
-    cd {0}; 
-    echo `cat {1}`,`stat -c '%Y' {1}`;"""
-# Fetch the completed output file
-FETCH = """#!/bin/bash
-    cd {0}; 
-    cat {4};
-    cat {5} >&2;"""
-# For testing
-TEST = """#!/bin/bash
-    echo testing;"""
-# Run a remote command
-START = """#!/bin/bash
-    mkdir -p {0};
-    cd {0};
-    touch {1}; 
-    cat >{2}; 
-    monitor() {{ 
-        user_command() {{
-            {3}
-        }}
-        user_command &
-        while true; do 
-            pids=`jobs -rp`; 
-            if [ -z \"$pids\" ]; then 
-                break; 
-            fi; 
-            echo $pids >{1}; 
-            sleep 1; 
-        done; 
-        echo 'Done' >{1}; 
-    }}; 
-    monitor </dev/null >/dev/null 2>/dev/null & 
-    echo `stat -c '%Y' {1}`;"""
-# The actual task will look like this:
-# <{0} COMMAND >{1} 2>{2} where parameters are input, output, and error files
-def subformat(command, machine, task):
-    # Build the command
-    pidfile, infile, outfile, errfile = ['kssh_{0}_pid'.format(KEY), 'kssh_{0}_in'.format(KEY), 'kssh_{0}_out'.format(KEY), 'kssh_{0}_err'.format(KEY)]
-    connect = CONNECT.format(machine.ssh_options, machine.username, machine.hostname)
-    task = task.format(infile, outfile, errfile)
-    command = command.format(machine.wd, pidfile, infile, task, outfile, errfile)
-    return '{0} {1}'.format(connect, pipes.quote(command))
-    
-def execute(command):
-    #log(LOCALHOST, 'executing shell script')
-    return subprocess.check_output(command, shell=True)
-
+def createUUID():
+    return str(uuid.uuid4())[:8]
+KEY = createUUID()
 LOCALHOST='localhost'
 def log(host, msg):
-    print >>sys.stderr, '[{0}][{1}] {2}'.format(time.ctime(), host, msg)
+    print >>sys.stderr, '[{0}] [{1}] {2}'.format(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), host, msg)
+
+class input_mode(object):
+    ''' Method of dividing data among nodes. '''
+    unknown = 0
+    lines = 1 # Ship lines of data to nodes
+    files = 2 # Ship whole files of data to nodes
+INPUT_MODE = input_mode.unknown
+
+class distribution_mode(object):
+    ''' Method of delivering data to the remote nodes. '''
+    unknown = 0
+    failover = 1 # Evenly distribute among nodes, move a task to a different node only on failure
+    performance = 2 # Shift tasks to the faster performing nodes
+DISTRIBUTION_MODE = input_mode.unknown
+
+class Transaction(object):
+    ''' Wraps a transaction from the control to the nodes. '''
+    TIMEOUT = 20
+    RETRIES = 0
+    CONCURRENCY = 10
+    SUCCESS_CODE = 0
+
+    class TimeoutError(Exception):
+        pass
+
+    class Status:
+        incomplete = 0
+        success = 1
+        timeout = 2
+        error = 3
+
+    def __init__(self, machine, cmd, timeout = None, retries = None, stdin = None, \
+                       stdout = None, stderr = None, state = None, callback = None, success_code = None):
+        self.machine = machine
+        self.cmd = cmd
+        self.timeout = Transaction.TIMEOUT if timeout is None else timeout
+        self.retries = Transaction.RETRIES if retries is None else retries
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.state = state # Caller defined stack object
+        self.status = Transaction.Status.incomplete
+        self.exit_code = None
+        self.output = None
+        self.elapsed = None
+        self.callback = callback # Callback function to invoke once the transaction finishes
+        self.success_code = Transaction.SUCCESS_CODE if success_code is None else success_code
+        self._attempt = 0
+        self._thread = None
+
+    def go(self):
+        ''' Start the remote transaction '''
+        self._thread = threading.Thread(target = self._run)
+        self._thread.start()
+
+    def _run(self):
+        start = time.time()
+        try:
+            cmd = '{1} {2}@{3} {4}'.format(self.stdin, self.machine.connect_cmd, self.machine.username, \
+                                                  self.machine.hostname, pipes.quote(self.cmd), self.stdout, self.stderr)
+            if self.stdin is not None:
+                cmd = '<{0} {1}'.format(self.stdin, cmd)
+            if self.stdout is not None:
+                cmd = '{0} >{1}'.format(cmd, self.stdout)
+            if self.stderr is not None:
+                cmd = '{0} 2>{1}'.format(cmd, self.stderr)
+            #log(self.machine.hostname, 'executing: {0}'.format(cmd))
+            #with Transaction.Timeout(seconds = self.timeout):
+            #self.output = subprocess.check_output(cmd, shell = True)
+            proc = subprocess.Popen(cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+            while proc.poll() is None: # Polling loop to check whether the process has completed
+                delta = time.time() - start
+                if delta > self.timeout:
+                    proc.kill() # Kill the process that is taking too long
+                    raise Transaction.TimeoutError()
+                time.sleep(min(1, delta))
+            self.exit_code = proc.poll()
+            for line in proc.stderr: # Write stderr to log
+                log(self.machine.hostname, 'communication stderr: {0}'.format(line.rstrip()))
+            if self.exit_code != self.success_code: # Exit codes other than 0 indicate an error
+                raise subprocess.CalledProcessError('subprocess', self.exit_code)
+            self.output = proc.stdout.read() # Save the full output of the subprocess
+        except subprocess.CalledProcessError as e: # Unknown error occurred. This could be either a network error or a remote error running the script
+            log(self.machine.hostname, 'communication error << {0} >>'.format(e))
+            self.status = Transaction.Status.error
+        except Transaction.TimeoutError:
+            log(self.machine.hostname, 'communication timeout')
+            if self._attempt < self.retries: # Optionally retry N times
+                self._attempt += 1
+                self.go()
+                return
+            self.status = Transaction.Status.timeout
+        else:
+            self.status = Transaction.Status.success
+            self.elapsed = time.time() - start # Record how long the transaction took
+
+    @classmethod
+    def many(cls, machines, cmd, stdin = None, stdout = None, concurrency = None, timeout = None, retries = None):
+        ''' Run the same command on many machines. '''
+        trans = []
+        for machine in machines:
+            trans.append(Transaction(machine, cmd, timeout = timeout, retries = retries))
+        cls.sync(trans, concurrency = concurrency)
+        return trans
+
+    @classmethod
+    def sync(cls, transactions, concurrency = None):
+        ''' Run transactions in parallel with a maximum concurrency.
+            Waits for all transactions to complete before returning. '''
+        active = [None] * (Transaction.CONCURRENCY if concurrency is None else concurrency)
+        for t in transactions:
+            i = 0
+            while i < len(active):
+                if active[i] is None or active[i].status != Transaction.Status.incomplete:
+                    active[i] = t
+                    t.go()
+                    break
+                elif i == len(active) - 1:
+                    time.sleep(1)
+                    i = 0
+                else:
+                    i += 1
+        for a in active:
+            while a is not None and a.status == Transaction.Status.incomplete:
+                time.sleep(1)
+
+def init_machines(machines, init_file, init_script):
+    '''Here, we deliver the initialization file,
+       run the initialization command. '''
+    if init_file is not None:
+        log(LOCALHOST, 'distributing init file')
+        INIT_FILE = """mkdir -p {0} && cd {0} && cat >{1}"""
+        trans = []
+        for m in machines:
+            trans.append(Transaction(m, INIT_FILE.format(m.wd, os.path.basename(init_file)), stdin = init_file, timeout = m.init_timeout))
+        Transaction.sync(trans)
+        init_machines = []
+        for t in trans:
+            if t.status == Transaction.Status.success:
+                init_machines.append(t.machine)
+        machines = init_machines
+
+    if init_script is not None:
+        log(LOCALHOST, 'executing init script')
+        INIT_SCRIPT = """mkdir -p {0} && cd {0} && cat >{1} && chmod a+x {1} && ./{1}"""
+        trans = []
+        for m in machines:
+            trans.append(Transaction(m, INIT_SCRIPT.format(m.wd, os.path.basename(init_script)), stdin = init_script, timeout = m.init_timeout))
+        Transaction.sync(trans)
+        init_machines = []
+        for t in trans:
+            if t.status == Transaction.Status.success:
+                init_machines.append(t.machine)
+        machines = init_machines
+
+    return machines
 
 class Machine(object):
-    def __init__(self, hostname, username, wd = '.', ssh_options = '', polling_interval = 10):
+    ''' State object for a remote machine. '''
+    def __init__(self, hostname, username, wd = '.', connect_cmd = '', poll_interval = 10, init_timeout = 20, upload_timeout = 20, download_timeout = 20, poll_timeout = 5):
         self.hostname = hostname
         self.username = username
         self.wd = wd
-        self.ssh_options = ssh_options
-        self.recheck = polling_interval
+        self.connect_cmd = connect_cmd
+        self.poll_interval = poll_interval
+        self.init_timeout = init_timeout
+        self.upload_timeout = upload_timeout
+        self.download_timeout = download_timeout
+        self.poll_timeout = poll_timeout
         self.start = None
         self.block = None
-        self.polled = None
+        self.polled = 0
+        self.done = False
         self.heartbeat = ''
+        self.completed = 0
         self._errors = 0
         self._exclude = False
-        log(self.hostname, 'initializing machine << username = {0}, wd = {1}, polling_interval = {2}, ssh_options = {3} >>'.format(username, wd, polling_interval, ssh_options))
+        log(self.hostname, 'found machine << {0} {1}@{2}:{3} >>'.format(self.connect_cmd, self.username, self.hostname, self.wd))
 
     def exclude(self):
         return self._exclude
-        
+
     def error(self):
         self._errors += 1
         if self._errors > 5:
@@ -112,59 +214,123 @@ class Machine(object):
             self._exclude = True
         return self.exclude()
 
-class Output(object):
-    def __init__(self, output, temp_directory, single_file = False):
+    @classmethod
+    def load_config(cls, filename):
+        """ Load machines configuration data from a JSON configuration file. """
+        json_data = None
+        with open(filename, 'r') as machines:
+            json_data = json.load(machines)
+
+        # Find default
+        default = None
+        for data in json_data:
+            # Machine missing hostname, fatal
+            if 'hostname' not in data:
+                raise Exception('machine missing required property "hostname"')
+            if data['hostname'].lower() == 'default':
+                # Set defaults
+                default = data
+                break
+
+        # Convert to class
+        machines = []
+        for data in json_data:
+            # Set defaults
+            if default:
+                for value in default:
+                    if value not in data:
+                        data[value] = default[value]
+            if data['hostname'] != 'default':
+                machines.append(Machine(**data))
+        return machines
+
+class Filesystem(object):
+    ''' Access to the local filesystem on the controller. '''
+    def __init__(self, output, temp_directory):
         if not os.path.isdir(temp_directory):
             os.makedirs(temp_directory)
-        if single_file and type(output) is str and os.path.isdir(output):
-            raise Exception('Output must be a file!')
-        elif single_file and os.path.isfile(output):
-            os.remove(output)
-        elif not single_file and type(output) is not str:
-            raise Exception('Cannot write to stdout')
-        elif not single_file and not os.path.isdir(output):
-            os.makedirs(output)
-        self.temp_directory = temp_directory
-        self.single_file = single_file
         self.output = output
+        self.temp_directory = temp_directory
         self.temp_files = set()
 
+        if INPUT_MODE == input_mode.lines:
+            self.init_lines_mode()
+        elif INPUT_MODE == input_mode.files:
+            self.init_files_mode()
+        else:
+            raise Exception('input mode not set')
+
+    def init_files_mode(self):
+        if type(self.output) is not str:
+            raise Exception('cannot write multiple files to stdout')
+        elif not os.path.isdir(self.output):
+            os.makedirs(self.output)
+        self.write = self.write_files_mode
+
+    def write_files_mode(self, machine, block, tempfile_out, tempfile_err):
+        filename_out = os.path.join(self.output, os.path.basename(block.filename)+'.out')
+        filename_err = os.path.join(self.output, os.path.basename(block.filename)+'.err')
+        i = 0
+        while os.path.isfile(filename_out):
+            i += 1
+            filename_out = os.path.join(self.output, os.path.basename(block.filename)+'.out'+str(i))
+            filename_err = os.path.join(self.output, os.path.basename(block.filename)+'.err'+str(i))
+
+        shutil.move(tempfile_out, filename_out)
+        self.temp_files.remove(tempfile_out)
+
+        with open(tempfile_err, 'r') as temp_file:
+            for line in temp_file:
+                log(machine.hostname, 'TASK STDERR: {0}'.format(line.rstrip()))
+        self.removeTempFile(tempfile_err)
+
+        log(LOCALHOST, 'wrote {0} to output file {1}'.format(block.description, filename))
+
+    def init_lines_mode(self):
+        if type(self.output) is str and os.path.isdir(self.output):
+            self.output = os.path.join(self.output, '{0}_result'.format(KEY))
+        if type(self.output) is str and os.path.isfile(self.output):
+            os.remove(self.output)
+        self.write = self.write_lines_mode
+
+    def write_lines_mode(self, machine, block, tempfile_out, tempfile_err):
+        with open(tempfile_out, 'r') as temp_file:
+            with open(self.output, 'a') as out_file:
+                out_file.writelines(temp_file.readlines())
+        self.removeTempFile(tempfile_out)
+
+        with open(tempfile_err, 'r') as temp_file:
+            for line in temp_file:
+                log(machine.hostname, 'TASK STDERR: {0}'.format(line.rstrip()))
+        self.removeTempFile(tempfile_err)
+
+        log(LOCALHOST, 'wrote {0} to output'.format(block.description))
+
+    def write(self, machine, block, tempfile_out, tempfile_err):
+        raise Exception('should be overridden!')
+
     def createTempFile(self):
-        filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(uuid.uuid4()))
+        filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(createUUID()))
         while filename in self.temp_files:
-            filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(uuid.uuid4()))
-        log(LOCALHOST, 'created temporary file "{0}"'.format(filename))
+            filename = os.path.join(self.temp_directory, 'kssh_{0}_temp'.format(createUUID()))
+        #log(LOCALHOST, 'created temporary file "{0}"'.format(filename))
         self.temp_files.add(filename)
         return filename
-        
-    def writeOutput(self, block, infile):
-        if self.single_file:
-            with open(infile, 'r') as temp_file:
-                with open(self.output, 'a') as out_file:
-                    out_file.writelines(temp_file.readlines())
-            self.removeTempFile(infile)
-        else:
-            filename = os.path.join(self.output, os.path.basename(block.stream())+'.out')
-            i = 0
-            while os.path.isfile(filename):
-                i += 1
-                filename = os.path.join(self.output, os.path.basename(block.stream())+'.out'+str(i))
-            shutil.move(infile, filename)
-            self.temp_files.remove(infile)
 
     def removeTempFile(self, filename):
         if filename in self.temp_files:
-            log(LOCALHOST, 'removing temporary file "{0}"'.format(filename))
+            #log(LOCALHOST, 'removing temporary file "{0}"'.format(filename))
             self.temp_files.remove(filename)
             try:
                 os.remove(filename)
             except OSError as e:
-                log(LOCALHOST, 'error removing "{0}": {1}'.format(filename, e))
+                log(LOCALHOST, 'error removing temp file {0}: {1}'.format(filename, e))
         else:
-            log(LOCALHOST, 'missing temporary file "{0}"'.format(filename))
+            log(LOCALHOST, 'missing temp file {0}'.format(filename))
 
-    def close(self):
+    def cleanup(self):
         # Remove all temporary files
+        log(LOCALHOST, "local clean up")
         for filename in self.temp_files.copy():
             self.removeTempFile(filename)
 
@@ -197,16 +363,13 @@ class Producer(object):
     def close(self):
         pass
 
+    def done(self, product):
+        pass
+
 class Product(object):
-    def __init__(self, data, key):
-        self.data = data
-        self.key = key
-
-    def stream(self):
-        return self.data
-
-    def name(self):
-        return self.key
+    def __init__(self, filename, description):
+        self.filename = filename
+        self.description = description
 
 class FileProducer(Producer):
     def __init__(self, data):
@@ -215,233 +378,347 @@ class FileProducer(Producer):
 
     def _next(self):
         if self.i < len(self.data):
-            key = self.data[self.i]
+            filename = self.data[self.i]
             self.i += 1
-            return Product(key, 'file {0}'.format(key))
+            return Product(filename, 'file {0}'.format(filename))
         raise StopIteration()
 
     def _more(self):
         return self.i < len(self.data)
 
+    def __len__(self):
+        return len(self.data)
+
 class LineProducer(Producer):
-    def __init__(self, data, blocksize = 1, output = None):
+    def __init__(self, data, blocksize = 1, filesystem = None):
+        if type(data) is str:
+            self.filename = data
+            data = open(data, 'r')
+        else:
+            self.filename = None
         super(self.__class__, self).__init__(data, blocksize)
-        self.output = output
+        self.filesystem = filesystem
         self.EOF = False
         self.i = 0
 
     def _next(self):
         lines = []
         x = 0
-        while x < self.blocksize:
-            try:
-                line = self.data.next()
-                lines.append(line)
-                x += 1
-            except StopIteration:
-                self.EOF = True
-                if len(lines) == 0:
-                    raise StopIteration()
-                else:
-                    break
-        filename = self.output.createTempFile()
+        filename = self.filesystem.createTempFile()
         with open(filename, 'w') as temp_file:
-            temp_file.writelines(lines)
+            while x < self.blocksize:
+                try:
+                    temp_file.write(self.data.next())
+                except StopIteration:
+                    self.EOF = True
+                    break
+                x += 1
+        if x == 0: # Read nothing
+            self.filesystem.removeTempFile(filename)
+            raise StopIteration()
         start_index = self.i
         self.i += x
-        return Product(filename, 'lines [{0},{1}]'.format(start_index+1, self.i))
-            
+        return Product(filename, 'lines [{0},{1}]'.format(start_index, self.i - 1))
+
     def _more(self):
         return not self.EOF
 
     def close(self):
         self.data.close()
 
+    def done(self, product):
+        self.filesystem.removeTempFile(product.filename)
+
+    def __len__(self):
+        if self.filename is None:
+            raise Exception('failover mode is not supported when input is <stdin>')
+        lines = 0
+        with open(self.filename, 'r') as infile:
+            for l in infile:
+                lines += 1
+        return lines
+
 class Distributor(object):
-    def __init__(self, source, machines, output, task):
+    class RemoteFailureError(Exception):
+        pass
+
+    def __init__(self, source, machines, filesystem, task, success_code):
         self.source = source
         self.machines = machines
-        self.output = output
+        self.filesystem = filesystem
         self.task = task
+        self.success_code = success_code
+
+    MIN_INT = 1
+    MAX_INT = 300
+    ALPHA = 0.75
+    def compute_interval(self, sample, previous):
+        ''' Waited moving average used to estimate timeouts and polling interval '''
+        return min(Distributor.MAX_INT, max(Distributor.MIN_INT, \
+            int(Distributor.ALPHA * sample + (1 - Distributor.ALPHA) * previous)))
+
+    def check_pre(self, machine):
+        ''' Check the status of a remote task '''
+        CHECK = """cd {0} && echo `stat -c '%Y' kssh_{1}_pid`,`cat kssh_{1}_pid`"""
+        cmd = CHECK.format(machine.wd, KEY)
+        log(machine.hostname, 'polling for {0}'.format(machine.block.description))
+        machine.polled = time.time()
+        return Transaction(machine, cmd, timeout = machine.poll_timeout, callback = self.check_post)
+
+    def check_post(self, trans):
+        machine = trans.machine
+        try:
+            if trans.status != Transaction.Status.success:
+                if trans.status == Transaction.Status.timeout: # Backoff if timeout
+                    machine.poll_timeout *= 2
+                raise Distributor.RemoteFailureError()
+
+            try:
+                check = trans.output.split(',')
+                if len(check) >= 1:
+                    heartbeat = int(check[0])
+                else:
+                    raise Distributor.RemoteFailureError()
+                if len(check) >= 2:
+                    pid = check[1]
+                else:
+                    raise Distributor.RemoteFailureError()
+                if len(check) >= 3:
+                    rcode = int(check[2])
+                else:
+                    rcode = None
+            except ValueError:
+                raise Distributor.RemoteFailureError()
+
+            if pid == 'Done':
+                if rcode == self.success_code: # task completed with exit code succeeds
+                    machine.poll_interval = self.compute_interval((heartbeat - machine.start) * 1.1 / 4, machine.poll_interval) # Try to time it so that we will poll immediately after the task completes
+                    log(machine.hostname, '{0} complete in {1} secs, polling interval {2} secs'.format(machine.block.description, heartbeat - machine.start, machine.poll_interval))
+                    machine.done = True # Set flag indicate task is waiting to be fetched
+                    machine.polled = 0 # Reset so the task will immediately be fetched next scan
+                else:
+                    log(machine.hostname, '{0} failed with exit code {1}'.format(machine.block.description, rcode))
+                    self.machine_error(machine)
+                    self.source.retry(machine.block)
+                    machine.block = None
+            elif heartbeat != machine.heartbeat: # Heartbeat still going
+                machine.heartbeat = heartbeat # Update heartbeat to make sure it changes between polls
+            else:
+                raise Distributor.RemoteFailureError()
+            machine.poll_timeout = self.compute_interval(trans.elapsed * 1.5, machine.poll_timeout) # Update timeout
+        except Distributor.RemoteFailureError:
+            if self.machine_error(machine): # Too many errors, machine will not be used going forward
+                self.source.retry(machine.block) # Give the block back to the queue
+                machine.block = None # Remove block assignment
+
+    def start_pre(self, machine, block):
+        START = """mkdir -p {0} && cd {0} && cat >kssh_{1}_in && touch kssh_{1}_pid;
+            monitor() {{
+                <kssh_{1}_in {2} >kssh_{1}_out 2>kssh_{1}_err &
+                pid=$!
+                while kill -0 $pid 2>/dev/null; do
+                    echo $pid >kssh_{1}_pid;
+                    sleep 1;
+                done;
+                wait $pid
+                echo Done,$? >kssh_{1}_pid;
+            }};
+            monitor </dev/null >/dev/null 2>/dev/null &
+            echo `stat -c '%Y' kssh_{1}_pid`"""
+        cmd = START.format(machine.wd, KEY, self.task)
+        log(machine.hostname, 'assigning {0}'.format(block.description))
+        return Transaction(machine, cmd, stdin = block.filename, state = block, timeout = machine.upload_timeout, callback = self.start_post)
+
+    def start_post(self, trans):
+        machine = trans.machine
+        block = trans.state
+        machine.start = int(trans.output)
+        if trans.status == Transaction.Status.success:
+            machine.block = block # Complete the assignment
+            machine.upload_timeout = self.compute_interval(trans.elapsed * 1.5, machine.upload_timeout) # Update timeout
+            machine.polled = time.time() # Set polling time
+            log(machine.hostname, 'assigned {0}'.format(machine.block.description))
+        else:
+            if trans.status == Transaction.Status.timeout: # Backoff if timeout
+                machine.upload_timeout *= 2
+            self.source.retry(block) # Give the block back to the queue
+            self.machine_error(machine) # Report an error for this machine
+
+    def fetch_pre(self, machine):
+        FETCH = """cd {0} && cat kssh_{1}_out && cat kssh_{1}_err >&2;"""
+        cmd = FETCH.format(machine.wd, KEY)
+        filename_out = self.filesystem.createTempFile()
+        filename_err = self.filesystem.createTempFile()
+        log(machine.hostname, 'fetching {0} to >{1} 2>{2}'.format(machine.block.description, filename_out, filename_err))
+        return Transaction(machine, cmd, stdout = filename_out, stderr = filename_err, state = (filename_out, filename_err), timeout = machine.download_timeout, callback = self.fetch_post)
+
+    def fetch_post(self, trans):
+        machine = trans.machine
+        filename_out, filename_err = trans.state
+        machine.done = False # Reset flag indicating there is a completed task on the machine
+        block = machine.block
+        machine.block = None # Remove the block assignment
+        if trans.status == Transaction.Status.success:
+            log(machine.hostname, 'fetched {0} to >{1} 2>{2}'.format(block.description, filename_out, filename_err))
+            self.filesystem.write(machine, block, filename_out, filename_err) # Write the block to filesystem
+            self.source.done(block) # Report the block complete for cleanup
+            machine.polled = 0 # Reset so that the machine will be immediately assigned a new task in the next scan
+            machine.completed += 1 # Completed download
+            machine._errors = 0 # Reset the error count since we successful fetched a task from the machine (errors could be temporal)
+            machine.download_timeout = self.compute_interval(trans.elapsed * 1.5, machine.download_timeout) # Update timeout
+        else:
+            if trans.status == Transaction.Status.timeout: # Backoff if timeout
+                machine.download_timeout *= 2
+            self.source.retry(block) # Give the block back to the queue
+            self.machine_error(machine) # Report an error for this machine
+
+    def action(self, machine):
+        trans = None
+        # Machine currently crunching on a block
+        if machine.block:
+            if machine.done:
+                trans = self.fetch_pre(machine)
+            elif machine.polled + machine.poll_interval < time.time():
+                # Time to check the machine again
+                trans = self.check_pre(machine)
+        elif not machine.exclude() and self.source.more():
+            try:
+                trans = self.start_pre(machine, self.source.next())
+            except StopIteration:
+                # Out of source to process
+                pass
+        return trans
+
+    def machine_error(self, machine):
+        return machine.error()
 
     def run(self):
         # While there is more data to crunch
         # or some machines are currently processing
         processing = True
         while processing:
-            min_recheck = time.time() + 120
+            min_recheck = time.time() + 60 # perform a loop at least every 1 min
             log(LOCALHOST, 'scanning')
+            # Storage
+            transL = []
 
             processing = False
             for machine in self.machines:
-                # Machine currently crunching on a block
+                t = self.action(machine)
+                if t is not None:
+                    transL.append(t)
+                    processing = True
                 if machine.block:
                     processing = True
-                    if machine.polled + machine.recheck < time.time():
-                        # Time to check the machine again
-                        self.check(machine)
-                elif not machine.exclude() and self.source.more():
-                    try:
-                        self.dispatch(machine, self.source.next())
-                        processing = True
-                    except StopIteration:
-                        # Out of source to process
-                        pass
-                if not machine.exclude():
-                    min_recheck = min(machine.polled + machine.recheck, min_recheck)
 
-            min_recheck = max(1, int(min_recheck - time.time()))
-            log(LOCALHOST, 'sleeping {0} seconds'.format(min_recheck))
-            time.sleep(min_recheck)
-        for machine in self.machines:
-            self.cleanup(machine)
+            Transaction.sync(transL) # Run remote transactions
+            for t in transL: # Post actions
+                t.callback(t)
 
-    def dispatch(self, machine, block):
-        log(machine.hostname, 'assigning task "{0}"'.format(block.name()))
-        try:
-            machine.start = int(execute('<{0} '.format(block.stream()) + subformat(START, machine, self.task)))
-        except subprocess.CalledProcessError as e:
-            log(machine.hostname, 'error dispatching task << {0} >>'.format(e))
-            self.source.retry(block)
-            machine.error()
-        else:
-            machine.block = block
-            machine.polled = time.time()
-            
-    def check(self, machine):
-        log(machine.hostname, 'polling')
-        machine.polled = time.time()
-        heartbeat = None
-        pid = None
-        try:
-            check = execute(subformat(CHECK, machine, self.task)).strip().split(',')
-            if len(check) >= 2:
-                heartbeat = int(check[1])
-            if len(check) >= 1:
-                pid = check[0]
-            log(machine.hostname, 'heartbeat = {0}, status = {1}'.format(heartbeat, pid))
-        except subprocess.CalledProcessError as e:
-            log(machine.hostname, 'error polling << {0} >>'.format(e))
-            if machine.error():
-                self.source.retry(machine.block)
-                machine.block = None
-        else:
-            if pid == 'Done':
-                # Task finished                
-                log(machine.hostname, 'task complete')
-                # WMA for recheck period updated to half of the time to task completion
-                machine.recheck = compute_interval(heartbeat - machine.start, machine.recheck)
-                log(machine.hostname, 'polling_interval = {0} seconds'.format(machine.recheck))
-                self.fetch(machine)
-            elif heartbeat == None or heartbeat == machine.heartbeat:
-                # Heartbeat hasn't updated, process may not be running any longer
-                log(machine.hostname, 'heartbeat failure')
-                if machine.error():
-                    self.source.retry(machine.block)
-                    machine.block = None
-            machine.heartbeat = heartbeat
+            sleep = False
+            for machine in self.machines:
+                if not machine.exclude() and (machine.block or self.source.more()):
+                    min_recheck = min(machine.polled + machine.poll_interval, min_recheck)
+                    sleep = True
+            if sleep:
+                min_recheck = max(1, int(math.ceil(min_recheck - time.time())))
+                log(LOCALHOST, 'wake in {0} secs'.format(min_recheck))
+                time.sleep(min_recheck)
 
-    def fetch(self, machine):
-        try:
-            filename_out = self.output.createTempFile()
-            filename_err = self.output.createTempFile()
-            log(machine.hostname, 'writing stdout to "{0}"'.format(filename_out))
-            log(machine.hostname, 'writing stderr to "{0}"'.format(filename_err))
-            execute(subformat(FETCH, machine, self.task) + ' >{0}'.format(filename_out) + ' 2>{0}'.format(filename_err))
-        except subprocess.CalledProcessError as e:
-            log(machine.hostname, 'error fetching << {1} >>'.format(e))
-            machine.error()
-        else:
-            log(machine.hostname, 'fetch complete for task "{0}"'.format(machine.block.name()))
-            self.output.writeOutput(machine.block, filename_out)
-            with open(filename_err, 'r') as file_err:
-                content = file_err.read()
-                if content != '':
-                    log(machine.hostname, 'remote error << {0} >>'.format(content))
-            self.output.removeTempFile(filename_err)
-            machine.block = None
+    def cleanup(self):
+        '''Wipe everything in the working directory
+           on remote machines. Use with extreme caution!'''
+        CLEANUP = """cd {0} && rm -rf *"""
+        trans = []
+        log(LOCALHOST, "remote clean up")
+        for m in machines:
+            trans.append(Transaction(m, CLEANUP.format(m.wd)))
+        Transaction.sync(trans)
 
-    def cleanup(self, machine):
-        log(machine.hostname, 'clean up')
-        try:
-            execute(subformat(CLEANUP, machine, self.task))
-        except subprocess.CalledProcessError as e:
-            log(machine.hostname, 'error cleaning up << {0} >>'.format(e))
+class FailoverDistributor(Distributor):
+    def __init__(self, source, machines, filesystem, task, success_code):
+        super(self.__class__, self).__init__(source, machines, filesystem, task, success_code)
+        log(LOCALHOST, 'calculating number of input blocks')
+        self.total_blocks = len(self.source)
+        self.good_machines = list(self.machines)
+        log(LOCALHOST, 'input contains {0} blocks'.format(self.total_blocks))
 
-def load_machines_config(filename):
-    """ Load machines configuration data from a JSON configuration file. """
-    json_data = None
-    with open(filename, 'r') as machines:
-        json_data = json.load(machines)
+    def action(self, machine):
+        trans = None
+        # Machine currently crunching on a block
+        if machine.block:
+            if machine.done:
+                trans = self.fetch_pre(machine)
+            elif machine.polled + machine.poll_interval < time.time():
+                # Time to check the machine again
+                trans = self.check_pre(machine)
+        elif not machine.exclude() and self.source.more() and machine.completed < self.blocks_per_machine():
+            try:
+                trans = self.start_pre(machine, self.source.next())
+            except StopIteration:
+                # Out of source to process
+                pass
+        return trans
 
-    # Find default
-    default = None
-    for data in json_data:
-        # Machine missing hostname, fatal
-        if 'hostname' not in data:
-            raise Exception('machine missing required property "hostname"')
-        if data['hostname'].lower() == 'default':
-            # Set defaults
-            default = data
-            break
+    def blocks_per_machine(self):
+        return int(math.ceil((float(self.total_blocks) / len(self.good_machines))))
 
-    # Convert to class
-    machines = []
-    for data in json_data:
-        # Set defaults
-        if default:
-            for value in default:
-                if value not in data:
-                    data[value] = default[value]
-        if data['hostname'] != 'default':
-            machines.append(Machine(**data))
-    return machines
+    def machine_error(self, machine):
+        ret = machine.error()
+        if ret:
+            self.good_machines.remove(machine)
+        return ret
 
 if __name__ == "__main__":
     # set up command line args
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,\
                                      description='Split a task across machines')
-    parser.add_argument('-o', '--output', default=sys.stdout, help='file or directory to write output')
-    parser.add_argument('-i', '--input', nargs='+', default=[sys.stdin], help='data to be distributed')
-    parser.add_argument('-b', '--blocksize', type=int, default=1, help='number of lines to assign per block (only works if input is a single file)')
-    parser.add_argument('-s', '--shuffle', action='store_true', default=False, help='shuffle the input before distribution')
-    parser.add_argument('-m', '--machines', default='.machines', help='json file listing the machines to be used')
-    parser.add_argument('-t', '--task', default='sleep 3 && <{0} cat >{1} 2>{2}', help='bash commands to execute on remote machines. Use {0} for input, {1} for output, and {2} for error')
-    parser.add_argument('-e', '--temp_directory', default='.', help='directory for writing temporary files')
+    parser.add_argument('--init-file', help='file to deliver to all machines for initialization')
+    parser.add_argument('--init-script', help='script file to run on all machines for initialization')
+    parser.add_argument('-i', '--input', nargs='+', default=[sys.stdin], help='data to distribute. May be a single file to split among the machines or multiple files / directories to divide among machines')
+    parser.add_argument('-b', '--blocksize', type=int, default=1, help='number of lines of input to assign per block (ignore if input is not a single file)')
+    parser.add_argument('-s', '--shuffle', action='store_true', default=False, help='shuffle the input before distribution for random assignment')
+    parser.add_argument('-m', '--machines', default='.machines', help='json file listing the machines to use')
+    parser.add_argument('-t', '--task', default='cat -', help='task to perform remotely (a shell command). Will be invoked as: <stdin [task] >stdout 2>stderr. Task must exit with code 0 on success')
+    parser.add_argument('--task-success-code', default=0, type=int, help='exit code for tasks that indicates success')
+    parser.add_argument('-d', '--distribution-mode', default='performance', choices=['performance', 'failover'], help='failover distributes input evenly over machines unless there is a failure. performance distributes more input to machines that process faster')
+    parser.add_argument('-e', '--temp-directory', default='.', help='directory for writing temporary files')
+    parser.add_argument('-o', '--output', default=sys.stdout, help='file or directory to output results. If input is multiple files, output must be a directory')
+    parser.add_argument('--concurrency', default=10, type=int, help='maximum number of remote sessions to have open concurrently')
+    parser.add_argument('--cleanup-remote', action='store_true', default=False, help='Clean up the temporary files placed on remote machines')
     args = parser.parse_args()
+    Transaction.CONCURRENCY = args.concurrency
 
+    # Start the experiment
     log(LOCALHOST, "experiment key = {0}".format(KEY))
-
-    machines = load_machines_config(args.machines)
-    
-    task = None
-    # User can specify a file containing the task
-    if os.path.isfile(args.task):
-        with open(args.task, 'r') as task_file:
-            task = task_file.read()
-    # Or a command at the command line
-    else:
-        task = args.task
+    # Load the machines
+    log(LOCALHOST, "loading machine config << {0} >>".format(args.machines))
+    machines = Machine.load_config(args.machines)
 
     # Collect sources
     sources = []
     for source in args.input:
         # If source is a string, add the glob of files
         if type(source) is str:
+            if os.path.isdir(source):
+                source = os.path.join(source, '*')
             sources.extend(glob.glob(source))
         # Else there is only one source and it is stdin
         else:
             sources.append(source)
     # Shuffle order of sources
     if args.shuffle:
-            random.shuffle(sources)
-            
-    # Create the output object
-    output = Output(args.output, args.temp_directory, single_file = len(sources) == 1)
+        random.shuffle(sources)
+    INPUT_MODE = input_mode.lines if len(sources) == 1 else input_mode.files
+    log(LOCALHOST, "found {0} input sources, setting input mode '{1}'".format(len(sources), 'files' if len(sources) > 1 else 'lines'))
+
+    # Create the filesystem object
+    log(LOCALHOST, "reading filesystem")
+    filesystem = Filesystem(args.output, args.temp_directory)
 
     # Shuffling input lines
-    if len(sources) == 1 and args.shuffle:
-        log(LOCALHOST, "warning: shuffling input lines requires reading all input into memory")
+    if INPUT_MODE == input_mode.lines and args.shuffle:
+        log(LOCALHOST, "WARNING: shuffling input lines requires reading all input into memory")
         if type(sources[0]) is str:
             sources[0] = open(sources[0], 'r')
         data = sources[0].readlines()
@@ -449,7 +726,7 @@ if __name__ == "__main__":
         # Shuffle
         random.shuffle(data)
         # Write to temporary file
-        filename = output.createTempFile()
+        filename = filesystem.createTempFile()
         with open(filename, 'w') as data_file:
             data_file.writelines(data)
         data = None
@@ -458,16 +735,30 @@ if __name__ == "__main__":
     source = None
     # Data is a single source to be split by lines
     if len(sources) == 1:
-        if type(sources[0]) is str:
-            sources[0] = open(sources[0], 'r')
-        source = LineProducer(sources[0], args.blocksize, output)
+        source = LineProducer(sources[0], args.blocksize, filesystem)
     # Source is a set of files
     else:
         # Blocksize meaningless when distributing files
         if args.blocksize != 1:
-            log(LOCALHOST, "warning: block size must be 1 when input is multiple files")
+            log(LOCALHOST, "WARNING: block size is ignored when distributing files")
         source = FileProducer(sources)
 
-    Distributor(source, machines, output, task).run()
+    machines_good = init_machines(machines, args.init_file, args.init_script)
+
+    if args.distribution_mode == 'performance':
+        DISTRIBUTION_MODE = distribution_mode.performance
+        distributor = Distributor(source, machines_good, filesystem, args.task, args.task_success_code)
+    elif args.distribution_mode == 'failover':
+        DISTRIBUTION_MODE = distribution_mode.failover
+        distributor = FailoverDistributor(source, machines_good, filesystem, args.task, args.task_success_code)
+    distributor.run()
+
     source.close()
-    output.close()
+    if args.cleanup_remote:
+        distributor.cleanup()
+    filesystem.cleanup()
+
+    for machine in machines:
+        log(machine.hostname, "completed {0} tasks".format(machine.completed))
+
+    log(LOCALHOST, "done")

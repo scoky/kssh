@@ -1,17 +1,22 @@
 [{
 	"hostname": "default",
-	"username": "scoky",
-	"ssh_options": "-i /home/scoky/.ssh/id_rsa"
+	"username": "kschomp",
+	"connect_cmd": "ssh",
+	"poll_interval": 10,
+	"poll_timeout": 2,
+	"upload_timeout": 2,
+	"download_timeout": 2,
+	"init_timeout": 2
 },
 {
-	"hostname": "localhost",
-	"wd": "~/github/concurrent/work1"
+	"hostname": "desktop",
+	"wd": "~/work1"
 },
 {
-	"hostname": "localhost",
-	"wd": "~/github/concurrent/work2"
+	"hostname": "desktop",
+	"wd": "~/work2"
 },
 {
-	"hostname": "localhost",
-	"wd": "~/github/concurrent/work3"
+	"hostname": "desktop",
+	"wd": "~/work3"
 }]

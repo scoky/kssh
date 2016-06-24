@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+if [ -f remote_script ]; then
+  chmod a+x remote_script
+  echo "remote_script initialized" >&2
+else
+  echo "remote_script missing!" >&2
+fi
+echo "Finishing" >init_status
