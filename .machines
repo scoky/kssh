@@ -1,12 +1,12 @@
 [{
 	"hostname": "default",
-	"username": "kschomp",
-	"connect_cmd": "ssh",
+	"username": "user",
+	"connect_cmd": "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ConnectionAttempts=2",
 	"poll_interval": 10,
-	"poll_timeout": 2,
-	"upload_timeout": 2,
-	"download_timeout": 2,
-	"init_timeout": 2
+	"poll_timeout": 10,
+	"upload_timeout": 10,
+	"download_timeout": 10,
+	"init_timeout": 10
 },
 {
 	"hostname": "desktop",

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import os
 import sys
@@ -194,7 +194,9 @@ class Machine(object):
         self.poll_interval = poll_interval
         self.init_timeout = init_timeout
         self.upload_timeout = upload_timeout
+        self.upload_size = None
         self.download_timeout = download_timeout
+        self.download_size = None
         self.poll_timeout = poll_timeout
         self.start = None
         self.block = None
@@ -373,6 +375,9 @@ class Product(object):
         self.filename = filename
         self.description = description
 
+    def size(self):
+        return os.path.getsize(self.filename)
+
 class FileProducer(Producer):
     def __init__(self, data):
         super(self.__class__, self).__init__(data, 1)
@@ -454,14 +459,17 @@ class Distributor(object):
     MIN_INT = 1
     MAX_INT = 300
     ALPHA = 0.75
-    def compute_interval(self, sample, previous):
+    def wma(self, sample, previous):
         ''' Waited moving average used to estimate timeouts and polling interval '''
-        return min(Distributor.MAX_INT, max(Distributor.MIN_INT, \
-            int(Distributor.ALPHA * sample + (1 - Distributor.ALPHA) * previous)))
+        if previous is None:
+            return sample
+        else:
+            return min(Distributor.MAX_INT, max(Distributor.MIN_INT, \
+                       int(Distributor.ALPHA * sample + (1 - Distributor.ALPHA) * previous)))
 
     def check_pre(self, machine):
         ''' Check the status of a remote task '''
-        CHECK = """cd {0} && echo `stat -c '%Y' kssh_{1}_pid`,`cat kssh_{1}_pid`"""
+        CHECK = """cd {0} && echo `stat -c '%Y' kssh_{1}_pid`,`cat kssh_{1}_pid`,`stat -c '%s' kssh_{1}_pid`"""
         cmd = CHECK.format(machine.wd, KEY)
         log(machine.hostname, 'polling for {0}'.format(machine.block.description))
         machine.polled = time.time()
@@ -489,14 +497,19 @@ class Distributor(object):
                     rcode = int(check[2])
                 else:
                     rcode = None
+                if len(check) >= 4:
+                    size = int(check[3])
+                else:
+                    size = None
             except ValueError:
                 raise Distributor.RemoteFailureError()
 
             if pid == 'Done':
                 if rcode == self.success_code: # task completed with exit code succeeds
-                    machine.poll_interval = self.compute_interval((heartbeat - machine.start) * 1.1 / 4, machine.poll_interval) # Try to time it so that we will poll immediately after the task completes
+                    machine.poll_interval = self.wma((heartbeat - machine.start) * 1.1 / 4, machine.poll_interval) # Try to time it so that we will poll immediately after the task completes
                     log(machine.hostname, '{0} complete in {1} secs, polling interval {2} secs'.format(machine.block.description, heartbeat - machine.start, machine.poll_interval))
                     machine.done = True # Set flag indicate task is waiting to be fetched
+                    machine.remote_size = size
                     machine.polled = 0 # Reset so the task will immediately be fetched next scan
                 else:
                     log(machine.hostname, '{0} failed with exit code {1}'.format(machine.block.description, rcode))
@@ -507,7 +520,7 @@ class Distributor(object):
                 machine.heartbeat = heartbeat # Update heartbeat to make sure it changes between polls
             else:
                 raise Distributor.RemoteFailureError()
-            machine.poll_timeout = self.compute_interval(trans.elapsed * 1.5, machine.poll_timeout) # Update timeout
+            machine.poll_timeout = self.wma(trans.elapsed * 1.5, machine.poll_timeout) # Update timeout
         except Distributor.RemoteFailureError:
             if self.machine_error(machine): # Too many errors, machine will not be used going forward
                 self.source.retry(machine.block) # Give the block back to the queue
@@ -529,7 +542,11 @@ class Distributor(object):
             echo `stat -c '%Y' kssh_{1}_pid`"""
         cmd = START.format(machine.wd, KEY, self.task)
         log(machine.hostname, 'assigning {0}'.format(block.description))
-        return Transaction(machine, cmd, stdin = block.filename, state = block, timeout = machine.upload_timeout, callback = self.start_post)
+        if machine.upload_size is None:
+            to = machine.upload_timeout
+        else:
+            to = machine.upload_timeout * (block.size() / machine.upload_size)
+        return Transaction(machine, cmd, stdin = block.filename, state = block, timeout = to, callback = self.start_post)
 
     def start_post(self, trans):
         machine = trans.machine
@@ -537,7 +554,8 @@ class Distributor(object):
         machine.start = int(trans.output)
         if trans.status == Transaction.Status.success:
             machine.block = block # Complete the assignment
-            machine.upload_timeout = self.compute_interval(trans.elapsed * 1.5, machine.upload_timeout) # Update timeout
+            machine.upload_timeout = self.wma(trans.elapsed * 1.5, machine.upload_timeout) # Update timeout
+            machine.upload_size = self.wma(block.size(), machine.upload_size) # Keep track of the size of uploads
             machine.polled = time.time() # Set polling time
             log(machine.hostname, 'assigned {0}'.format(machine.block.description))
         else:
@@ -552,7 +570,11 @@ class Distributor(object):
         filename_out = self.filesystem.createTempFile()
         filename_err = self.filesystem.createTempFile()
         log(machine.hostname, 'fetching {0} to >{1} 2>{2}'.format(machine.block.description, filename_out, filename_err))
-        return Transaction(machine, cmd, stdout = filename_out, stderr = filename_err, state = (filename_out, filename_err), timeout = machine.download_timeout, callback = self.fetch_post)
+        if machine.download_size is None:
+            to = machine.download_timeout
+        else:
+            to = machine.download_timeout * (machine.remote_size / machine.download_size)
+        return Transaction(machine, cmd, stdout = filename_out, stderr = filename_err, state = (filename_out, filename_err), timeout = to, callback = self.fetch_post)
 
     def fetch_post(self, trans):
         machine = trans.machine
@@ -563,11 +585,12 @@ class Distributor(object):
         if trans.status == Transaction.Status.success:
             log(machine.hostname, 'fetched {0} to >{1} 2>{2}'.format(block.description, filename_out, filename_err))
             self.filesystem.write(machine, block, filename_out, filename_err) # Write the block to filesystem
+            machine.download_timeout = self.wma(trans.elapsed * 1.5, machine.download_timeout) # Update timeout
+            machine.download_size = self.wma(block.size(), machine.download_size) # Keep track of the size of downloads
             self.source.done(block) # Report the block complete for cleanup
             machine.polled = 0 # Reset so that the machine will be immediately assigned a new task in the next scan
             machine.completed += 1 # Completed download
             machine._errors = 0 # Reset the error count since we successful fetched a task from the machine (errors could be temporal)
-            machine.download_timeout = self.compute_interval(trans.elapsed * 1.5, machine.download_timeout) # Update timeout
         else:
             if trans.status == Transaction.Status.timeout: # Backoff if timeout
                 machine.download_timeout *= 2
